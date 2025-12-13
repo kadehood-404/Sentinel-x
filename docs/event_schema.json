@@ -1,0 +1,25 @@
+{
+  "event_id": "uuid",
+  "timestamp": "RFC3339",
+  "source": {
+    "type": "network | host | app",
+    "sensor": "string",
+    "hostname": "string",
+    "ip": "string"
+  },
+  "action": {
+    "category": "network | auth | file | process | anomaly",
+    "verb": "connect | read | write | exec | scan"
+  },
+  "object": {
+    "resource": "ip | domain | file | process",
+    "value": "string"
+  },
+  "detection": {
+    "method": "raw | signature | heuristic | anomaly",
+    "rule_id": "string | null",
+    "confidence": 0.0
+  },
+  "severity": "info | low | medium | high",
+  "raw": {}
+}
