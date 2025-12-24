@@ -1,0 +1,7 @@
+id: excessive_port_scanning
+description: High number of connection attempts
+match:
+  action.category: network
+threshold: 50
+window: 60
+severity: medium
