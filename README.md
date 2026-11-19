@@ -54,6 +54,39 @@ To maintain this zero-theatrics posture under load, the framework operates as a 
 
 ---
 
+## Agent Guard (Go)
+
+Layered enforcement for local LLM endpoints and agent pipelines. Standard library only, single static binaries, no cloud, no dashboard.
+
+| Binary / package | What it does | Status |
+|---|---|---|
+| `sentinel-core` (`internal/policy`) | Deterministic YAML rule engine, hot-reloaded, strict (typos fail loudly) | working |
+| `sentinel-bridge` | Proxy in front of Ollama/OpenAI-style endpoints (redact secrets + PII, block prompt injection, throttle loops) and `POST /v1/check` for agent tool calls | working |
+| audit ledger (`internal/ledger`) | Append-only, hash-chained JSONL. `sentinel-core verify` detects edits and deletions | working |
+| `sentinel-hammer` | Graduated containment: THROTTLE, SEVER, QUARANTINE (SIGSTOP / netns) | planned |
+| `sentinel-tap` | Process, file-integrity and socket telemetry (start with /proc + netlink, eBPF later) | planned |
+| `sentinel-tui`, `sigil-sync` | Operator console; Unix-socket link to SiGiL | planned |
+
+**Default is observe mode:** traffic is forwarded untouched and the ledger records what *would* have happened. Switch to `-mode enforce` once the verdicts look right.
+
+```
+make build && make test
+bin/sentinel-core lint rules/bridge
+bin/sentinel-bridge -upstream http://127.0.0.1:11434 -workspace ~/agent-workspace      # observe
+bin/sentinel-bridge -mode enforce ...                                                  # apply verdicts
+
+# agents ask before running a tool:
+curl -s localhost:11435/v1/check -d '{"tool":"bash","args":{"command":"rm -rf /"}}'
+
+bin/sentinel-core verify sentinel-ledger.jsonl
+```
+
+Point your Ollama clients at port `11435` instead of `11434`. The bridge only listens on loopback and refuses anything else unless you pass `-allow-nonlocal`, because it has no authentication. Prompt text and secret values are never written to the ledger; only rule IDs, finding names and confidence scores are.
+
+Known limits: pattern-based detection has false positives (a post *about* prompt injection will trip it) and misses novel phrasing; model responses are not scanned yet; the ledger detects tampering but not tail truncation unless you anchor its latest hash elsewhere.
+
+---
+
 ## Operational Roadmap
 
 - [x] Asynchronous multi-threaded worker pipeline infrastructure
