@@ -16,6 +16,7 @@ package bridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/kadehood-404/sentinel-x/internal/event"
 	"github.com/kadehood-404/sentinel-x/internal/ledger"
@@ -39,6 +41,7 @@ type Config struct {
 	Workspace string // default workspace for /v1/check
 	Hostname  string
 	MaxBody   int64 // bytes; 0 means 4 MiB
+	OnVerdict func(event.Event, policy.Verdict)
 	Logf      func(string, ...any)
 }
 
@@ -46,6 +49,11 @@ type Server struct {
 	cfg   Config
 	proxy *httputil.ReverseProxy
 	mux   *http.ServeMux
+
+	mu        sync.Mutex
+	nextReqID uint64
+	active    map[string]map[uint64]context.CancelFunc // session -> active stream cancels
+	revoked   map[string]bool
 }
 
 // Paths whose JSON bodies carry prompts.
@@ -67,9 +75,19 @@ func New(cfg Config) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	s := &Server{cfg: cfg, proxy: httputil.NewSingleHostReverseProxy(cfg.Upstream), mux: http.NewServeMux()}
+	s := &Server{
+		cfg:     cfg,
+		proxy:   httputil.NewSingleHostReverseProxy(cfg.Upstream),
+		mux:     http.NewServeMux(),
+		active:  map[string]map[uint64]context.CancelFunc{},
+		revoked: map[string]bool{},
+	}
 	s.proxy.FlushInterval = -1 // stream model output as it arrives
 	s.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if r.Context().Err() != nil {
+			// Stream was severed or client disconnected; avoid noisy bad-gateway logs.
+			return
+		}
 		cfg.Logf("upstream error: %v", err)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream unreachable"})
 	}
@@ -87,11 +105,79 @@ func New(cfg Config) *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
+// SeverSession implements hammer.SessionSeverer: it revokes the session token
+// and cancels all in-flight reverse-proxy streams belonging to session.
+func (s *Server) SeverSession(session string) int {
+	if session == "" {
+		return 0
+	}
+	s.mu.Lock()
+	s.revoked[session] = true
+	cancels := s.active[session]
+	delete(s.active, session)
+	s.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return len(cancels)
+}
+
+// UnrevokeSession restores a previously severed session.
+func (s *Server) UnrevokeSession(session string) {
+	s.mu.Lock()
+	delete(s.revoked, session)
+	s.mu.Unlock()
+}
+
+func (s *Server) isRevoked(session string) bool {
+	if session == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked[session]
+}
+
+func (s *Server) trackStream(session string, parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	if session == "" {
+		return ctx, cancel
+	}
+	s.mu.Lock()
+	s.nextReqID++
+	id := s.nextReqID
+	if s.active[session] == nil {
+		s.active[session] = map[uint64]context.CancelFunc{}
+	}
+	s.active[session][id] = cancel
+	s.mu.Unlock()
+
+	return ctx, func() {
+		cancel()
+		s.mu.Lock()
+		if m := s.active[session]; m != nil {
+			delete(m, id)
+			if len(m) == 0 {
+				delete(s.active, session)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
 // ---- prompt gate -----------------------------------------------------------
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	session := sessionID(r)
+	if s.cfg.Engine.Mode() == policy.Enforce && s.isRevoked(session) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "session severed by sentinel-x"})
+		return
+	}
 	if r.Method != http.MethodPost || !inspected[r.URL.Path] {
-		s.proxy.ServeHTTP(w, r)
+		ctx, untrack := s.trackStream(session, r.Context())
+		defer untrack()
+		s.proxy.ServeHTTP(w, r.WithContext(ctx))
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxBody))
@@ -108,7 +194,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(out))
 	r.ContentLength = int64(len(out))
 	r.Header.Set("Content-Length", strconv.Itoa(len(out)))
-	s.proxy.ServeHTTP(w, r)
+	ctx, untrack := s.trackStream(session, r.Context())
+	defer untrack()
+	s.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 // inspect judges a prompt body. It returns the body to forward, or stop=true
@@ -140,6 +228,9 @@ func (s *Server) inspect(w http.ResponseWriter, r *http.Request, body []byte) ([
 	ev := s.verdictEvent("prompt", r.URL.Path, session, v, findings)
 	if len(v.Matches) > 0 {
 		s.log(ev)
+		if s.cfg.OnVerdict != nil {
+			s.cfg.OnVerdict(ev, v)
+		}
 	}
 
 	switch {
@@ -207,6 +298,17 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		req.Workspace = s.cfg.Workspace
 	}
 
+	if s.cfg.Engine.Mode() == policy.Enforce && s.isRevoked(req.Session) {
+		writeJSON(w, http.StatusOK, CheckResponse{
+			Decision:  "deny",
+			Action:    policy.Sever.String(),
+			Effective: policy.Sever.String(),
+			Mode:      s.cfg.Engine.Mode().String(),
+			Matches:   []policy.Match{{RuleID: "session-severed", Description: "Session token revoked by sentinel-hammer", Severity: "high", Action: "SEVER", Reason: "session severed"}},
+		})
+		return
+	}
+
 	argText := scan.Flatten(req.Args)
 	paths := scan.ExtractPaths(argText)
 	for k, v := range req.Args { // explicit path-ish arguments count even if they are relative
@@ -215,15 +317,21 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	findings := scan.Scan(argText)
+	for _, dom := range scan.ExtractDomains(argText) {
+		findings = append(findings, scan.ScanDomain(dom)...)
+	}
 
 	v := s.cfg.Engine.Evaluate(policy.Input{
-		Target: "tool_call", Session: req.Session, Tool: req.Tool, ArgText: argText,
+		Target: "tool_call", Session: req.Session, Tool: req.Tool, Verb: "exec", ArgText: argText,
 		Paths: paths, Workspace: req.Workspace, Findings: toPolicy(findings),
 	})
 	ev := s.verdictEvent("tool_call", req.Tool, req.Session, v, findings)
 	ev.Action = event.Action{Category: "process", Verb: "exec"}
 	if len(v.Matches) > 0 {
 		s.log(ev)
+		if s.cfg.OnVerdict != nil {
+			s.cfg.OnVerdict(ev, v)
+		}
 	}
 
 	resp := CheckResponse{
@@ -254,6 +362,7 @@ func (s *Server) newEvent(resource, value, session string) event.Event {
 	ev.Action = event.Action{Category: "anomaly", Verb: "scan"}
 	ev.Object = event.Object{Resource: resource, Value: value}
 	ev.Detection = event.Detection{Method: "signature", Confidence: 1}
+	ev.Session = session
 	ev.Raw = map[string]any{"session": session}
 	return ev
 }

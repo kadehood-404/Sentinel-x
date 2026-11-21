@@ -1,0 +1,79 @@
+# Default sentinel-tap telemetry ruleset (host processes, FIM, outbound sockets).
+#
+# In observe mode (the default) enforcing actions are recorded as would-have
+# verdicts without signaling processes or severing sessions.
+
+rules:
+  # ---- File-Integrity Monitoring (mutations / renames / metadata) ----------
+  - id: tap-fim-ssh-mutation
+    description: Sensitive ~/.ssh file created, modified, renamed or chmodded
+    target: file
+    severity: high
+    action: WARN
+    match:
+      action_verb: [write, create, rename, chmod, delete]
+      path_regex: '(?i)(^|/)(\.ssh/|authorized_keys|id_rsa|id_ed25519)'
+
+  - id: tap-fim-credentials-mutation
+    description: Credential file (.env, AWS/GPG/kube config) mutated or replaced
+    target: file
+    severity: high
+    action: WARN
+    match:
+      action_verb: [write, create, rename, chmod, delete]
+      path_regex: '(?i)(^|/)(\.env\b|\.aws/credentials|\.gnupg/|\.kube/config)'
+
+  - id: tap-fim-model-weights
+    description: Local LLM model weight file mutated or replaced
+    target: file
+    severity: medium
+    action: WARN
+    match:
+      action_verb: [write, create, rename, delete]
+      path_regex: '(?i)\.(gguf|safetensors|bin|pt|onnx)$'
+
+  # ---- Process & Privilege Escalation Telemetry ----------------------------
+  - id: tap-proc-privesc
+    description: Running process transitioned to root effective UID
+    target: process
+    severity: high
+    action: QUARANTINE
+    match:
+      action_verb: priv_esc
+
+  - id: tap-proc-reverse-shell
+    description: Suspicious reverse-shell or raw socket shell invocation
+    target: process
+    severity: high
+    action: QUARANTINE
+    match:
+      action_verb: exec
+      process_regex: '(?i)(\bnc\b.*-e\s+/bin/(ba)?sh|/dev/tcp/\d+\.\d+\.\d+\.\d+/|python3?\s+-c.*socket.*connect|bash\s+-i\s+>&)'
+
+  - id: tap-proc-pipe-to-shell
+    description: Process downloads remote script and pipes directly into a shell
+    target: process
+    severity: high
+    action: SEVER
+    match:
+      action_verb: exec
+      process_regex: '(?i)\b(curl|wget)\b[^|;]*\|\s*(sudo\s+)?(ba|z|da)?sh\b'
+
+  # ---- Outbound Socket & DNS Anomaly Telemetry -----------------------------
+  - id: tap-net-suspicious-c2-port
+    description: Outbound connection to common reverse-shell/C2 port
+    target: network
+    severity: high
+    action: SEVER
+    match:
+      action_verb: connect
+      dest_port: [4444, 5555, 1337, 31337, 6667]
+
+  - id: tap-net-dns-tunneling
+    description: High-entropy or encoded subdomain indicative of DNS tunneling
+    target: network
+    severity: high
+    action: SEVER
+    match:
+      finding: [anomaly]
+      min_confidence: 0.75

@@ -132,7 +132,7 @@ func TestLoadIsStrict(t *testing.T) {
 		"no conditions":    "rules:\n  - id: a\n    target: tool_call\n    action: WARN\n    match:\n      tool: []\n",
 		"redact on tool":   "rules:\n  - id: a\n    target: tool_call\n    action: REDACT\n    match:\n      finding: [secret]\n",
 		"duplicate id":     "rules:\n  - id: a\n    target: prompt\n    action: WARN\n    match:\n      finding: [pii]\n  - id: a\n    target: prompt\n    action: WARN\n    match:\n      finding: [pii]\n",
-		"bad target":       "rules:\n  - id: a\n    target: network\n    action: WARN\n    match:\n      finding: [pii]\n",
+		"bad target":       "rules:\n  - id: a\n    target: bogus_target\n    action: WARN\n    match:\n      finding: [pii]\n",
 		"bad finding kind": "rules:\n  - id: a\n    target: prompt\n    action: WARN\n    match:\n      finding: [vibes]\n",
 	}
 	for name, body := range bad {

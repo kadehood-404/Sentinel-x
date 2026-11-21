@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,15 +20,22 @@ import (
 type Rule struct {
 	ID          string
 	Description string
-	Target      string // prompt | tool_call | response
+	Target      string // prompt | tool_call | response | process | file | network | sigil_signal
 	Severity    string // info | low | medium | high
 	Action      Action
 
 	Tools            []string
+	Verbs            []string
 	ArgRegex         *regexp.Regexp
+	PathRegex        *regexp.Regexp
+	ProcessRegex     *regexp.Regexp
+	DestRegex        *regexp.Regexp
+	DestPorts        []int
 	OutsideWorkspace bool
 	FindingKinds     []string
 	MinConfidence    float64
+	MinSessionLock   LockLevel
+	HasMinLock       bool
 	RepeatCount      int
 	RepeatWindow     time.Duration
 
@@ -42,11 +50,17 @@ type Ruleset struct {
 }
 
 var (
-	validTargets    = map[string]bool{"prompt": true, "tool_call": true, "response": true}
+	validTargets = map[string]bool{
+		"prompt": true, "tool_call": true, "response": true,
+		"process": true, "file": true, "network": true, "sigil_signal": true,
+	}
 	validSeverities = map[string]bool{"info": true, "low": true, "medium": true, "high": true}
+	validFindings   = map[string]bool{"secret": true, "pii": true, "injection": true, "anomaly": true}
 	matchKeys       = map[string]bool{
-		"tool": true, "arg_regex": true, "outside_workspace": true,
-		"finding": true, "min_confidence": true, "repeat": true,
+		"tool": true, "action_verb": true, "arg_regex": true, "path_regex": true,
+		"process_regex": true, "dest_regex": true, "dest_port": true,
+		"outside_workspace": true, "finding": true, "min_confidence": true,
+		"min_session_lock": true, "repeat": true,
 	}
 	ruleKeys = map[string]bool{
 		"id": true, "description": true, "target": true, "severity": true, "action": true, "match": true,
@@ -162,7 +176,7 @@ func compileRule(item any) (*Rule, error) {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
 	if r.Target, err = str(m, "target", true); err != nil || !validTargets[r.Target] {
-		return nil, fmt.Errorf("rule %q: target must be prompt, tool_call or response", r.ID)
+		return nil, fmt.Errorf("rule %q: target must be prompt, tool_call, response, process, file, network or sigil_signal", r.ID)
 	}
 	if s, _ := str(m, "severity", false); s != "" {
 		if !validSeverities[s] {
@@ -177,7 +191,7 @@ func compileRule(item any) (*Rule, error) {
 	if r.Action, err = ParseAction(as); err != nil {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
-	if r.Action == Redact && r.Target == "tool_call" {
+	if r.Action == Redact && r.Target != "prompt" && r.Target != "response" {
 		return nil, fmt.Errorf("rule %q: REDACT only makes sense for prompt or response rules", r.ID)
 	}
 
@@ -196,11 +210,17 @@ func compileRule(item any) (*Rule, error) {
 	for i := range r.Tools {
 		r.Tools[i] = strings.ToLower(r.Tools[i])
 	}
+	if r.Verbs, err = strList(mm, "action_verb"); err != nil {
+		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
+	}
+	for i := range r.Verbs {
+		r.Verbs[i] = strings.ToLower(r.Verbs[i])
+	}
 	if r.FindingKinds, err = strList(mm, "finding"); err != nil {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
 	for _, k := range r.FindingKinds {
-		if k != "secret" && k != "pii" && k != "injection" {
+		if !validFindings[k] {
 			return nil, fmt.Errorf("rule %q: unknown finding kind %q", r.ID, k)
 		}
 	}
@@ -208,6 +228,24 @@ func compileRule(item any) (*Rule, error) {
 		if r.ArgRegex, err = regexp.Compile(expr); err != nil {
 			return nil, fmt.Errorf("rule %q: bad arg_regex: %w", r.ID, err)
 		}
+	}
+	if expr, _ := str(mm, "path_regex", false); expr != "" {
+		if r.PathRegex, err = regexp.Compile(expr); err != nil {
+			return nil, fmt.Errorf("rule %q: bad path_regex: %w", r.ID, err)
+		}
+	}
+	if expr, _ := str(mm, "process_regex", false); expr != "" {
+		if r.ProcessRegex, err = regexp.Compile(expr); err != nil {
+			return nil, fmt.Errorf("rule %q: bad process_regex: %w", r.ID, err)
+		}
+	}
+	if expr, _ := str(mm, "dest_regex", false); expr != "" {
+		if r.DestRegex, err = regexp.Compile(expr); err != nil {
+			return nil, fmt.Errorf("rule %q: bad dest_regex: %w", r.ID, err)
+		}
+	}
+	if r.DestPorts, err = intList(mm, "dest_port"); err != nil {
+		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
 	if v, ok := mm["outside_workspace"]; ok {
 		b, isBool := v.(bool)
@@ -222,6 +260,16 @@ func compileRule(item any) (*Rule, error) {
 			return nil, fmt.Errorf("rule %q: min_confidence must be a number from 0 to 1", r.ID)
 		}
 		r.MinConfidence = f
+	}
+	if s, err := str(mm, "min_session_lock", false); err != nil {
+		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
+	} else if s != "" {
+		lvl, err := ParseLockLevel(s)
+		if err != nil {
+			return nil, fmt.Errorf("rule %q: %w", r.ID, err)
+		}
+		r.MinSessionLock = lvl
+		r.HasMinLock = true
 	}
 	if v, ok := mm["repeat"]; ok {
 		rm, isMap := v.(map[string]any)
@@ -241,15 +289,16 @@ func compileRule(item any) (*Rule, error) {
 		r.RepeatCount = int(c)
 		r.RepeatWindow = time.Duration(w * float64(time.Second))
 	}
-	if len(r.Tools) == 0 && r.ArgRegex == nil && !r.OutsideWorkspace &&
-		len(r.FindingKinds) == 0 && r.RepeatCount == 0 {
+	if len(r.Tools) == 0 && len(r.Verbs) == 0 && r.ArgRegex == nil && r.PathRegex == nil &&
+		r.ProcessRegex == nil && r.DestRegex == nil && len(r.DestPorts) == 0 &&
+		!r.OutsideWorkspace && len(r.FindingKinds) == 0 && !r.HasMinLock && r.RepeatCount == 0 {
 		return nil, fmt.Errorf("rule %q: match has no conditions", r.ID)
 	}
 	return r, nil
 }
 
 // matches reports whether every condition holds, with a human-readable reason.
-func (r *Rule) matches(in Input, times []time.Time, now time.Time) (bool, string) {
+func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock LockLevel) (bool, string) {
 	var why []string
 
 	if len(r.Tools) > 0 {
@@ -265,11 +314,66 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time) (bool, string
 		}
 		why = append(why, "tool "+in.Tool)
 	}
+	if len(r.Verbs) > 0 {
+		hit := false
+		for _, vb := range r.Verbs {
+			if strings.EqualFold(vb, in.Verb) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			return false, ""
+		}
+		why = append(why, "verb "+in.Verb)
+	}
 	if r.ArgRegex != nil {
 		if !r.ArgRegex.MatchString(in.ArgText) {
 			return false, ""
 		}
 		why = append(why, "arguments matched pattern")
+	}
+	if r.PathRegex != nil {
+		matchedPath := ""
+		for _, p := range in.Paths {
+			if r.PathRegex.MatchString(p) {
+				matchedPath = p
+				break
+			}
+		}
+		if matchedPath == "" {
+			return false, ""
+		}
+		why = append(why, "path matched "+matchedPath)
+	}
+	if r.ProcessRegex != nil {
+		target := in.Process
+		if target == "" {
+			target = in.ArgText
+		}
+		if !r.ProcessRegex.MatchString(target) {
+			return false, ""
+		}
+		why = append(why, "process matched pattern")
+	}
+	if r.DestRegex != nil {
+		if !r.DestRegex.MatchString(in.Dest) {
+			return false, ""
+		}
+		why = append(why, "destination matched "+in.Dest)
+	}
+	if len(r.DestPorts) > 0 {
+		hit := false
+		for _, p := range r.DestPorts {
+			if p == in.DestPort {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			return false, ""
+		}
+		why = append(why, fmt.Sprintf("dest_port %d", in.DestPort))
 	}
 	if r.OutsideWorkspace {
 		p, out := OutsideWorkspace(in.Workspace, in.Paths)
@@ -291,6 +395,12 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time) (bool, string
 			return false, ""
 		}
 		why = append(why, "found "+strings.Join(dedupe(names), ", "))
+	}
+	if r.HasMinLock {
+		if sessionLock < r.MinSessionLock {
+			return false, ""
+		}
+		why = append(why, "session lock "+sessionLock.String())
 	}
 	if r.RepeatCount > 0 {
 		n := 0
@@ -370,6 +480,44 @@ func strList(m map[string]any, key string) ([]string, error) {
 		return out, nil
 	}
 	return nil, fmt.Errorf("%q must be text or a list of text values", key)
+}
+
+func intList(m map[string]any, key string) ([]int, error) {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil, nil
+	}
+	parseOne := func(x any) (int, error) {
+		switch t := x.(type) {
+		case int64:
+			return int(t), nil
+		case float64:
+			return int(t), nil
+		case string:
+			n, err := strconv.Atoi(t)
+			if err != nil {
+				return 0, fmt.Errorf("%q must be integer(s)", key)
+			}
+			return n, nil
+		}
+		return 0, fmt.Errorf("%q must be integer(s)", key)
+	}
+	if l, ok := v.([]any); ok {
+		out := make([]int, 0, len(l))
+		for _, item := range l {
+			n, err := parseOne(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, n)
+		}
+		return out, nil
+	}
+	n, err := parseOne(v)
+	if err != nil {
+		return nil, err
+	}
+	return []int{n}, nil
 }
 
 func num(v any) (float64, bool) {

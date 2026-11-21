@@ -12,19 +12,19 @@ import (
 )
 
 type Source struct {
-	Type     string `json:"type"` // network | host | app | agent
+	Type     string `json:"type"` // network | host | app | agent | sigil
 	Sensor   string `json:"sensor"`
 	Hostname string `json:"hostname"`
 	IP       string `json:"ip,omitempty"`
 }
 
 type Action struct {
-	Category string `json:"category"` // network | auth | file | process | anomaly
-	Verb     string `json:"verb"`     // connect | read | write | exec | scan
+	Category string `json:"category"` // network | auth | file | process | anomaly | control
+	Verb     string `json:"verb"`     // connect | read | write | rename | delete | chmod | exec | priv_esc | scan | control
 }
 
 type Object struct {
-	Resource string `json:"resource"` // ip | domain | file | process | prompt | tool_call
+	Resource string `json:"resource"` // ip | domain | file | process | prompt | tool_call | response | sigil_signal | control_cmd
 	Value    string `json:"value"`
 }
 
@@ -50,17 +50,19 @@ type Event struct {
 	Object    Object         `json:"object"`
 	Detection Detection      `json:"detection"`
 	Severity  string         `json:"severity"` // info | low | medium | high
+	Session   string         `json:"session,omitempty"`
+	PID       int            `json:"pid,omitempty"`
 	Verdict   *Verdict       `json:"verdict,omitempty"`
 	Raw       map[string]any `json:"raw,omitempty"`
 }
 
 // New returns an event with a fresh ID and timestamp.
 func New() Event {
-	return Event{EventID: newID(), Timestamp: time.Now().UTC(), Severity: "info"}
+	return Event{EventID: NewID(), Timestamp: time.Now().UTC(), Severity: "info"}
 }
 
-// newID returns a random RFC 4122 version 4 UUID.
-func newID() string {
+// NewID returns a random RFC 4122 version 4 UUID.
+func NewID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// crypto/rand failing is not recoverable in any useful way.

@@ -1,0 +1,19 @@
+# Default sigil-sync cross-module escalation ruleset.
+
+rules:
+  - id: sigil-prompt-injection-escalate
+    description: High-confidence prompt injection reported by SiGiL Sentry
+    target: sigil_signal
+    severity: high
+    action: SEVER
+    match:
+      finding: [injection]
+      min_confidence: 0.8
+
+  - id: sigil-secret-leak-warn
+    description: Secret or PII leak reported by SiGiL Sentry / sigil-proxy
+    target: sigil_signal
+    severity: medium
+    action: WARN
+    match:
+      finding: [secret, pii]

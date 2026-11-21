@@ -100,6 +100,45 @@ func Verify(path string) (uint64, error) {
 	return n, err
 }
 
+// Tail reads up to the last n records from path (without modifying the file).
+func Tail(path string, n int) ([]Record, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 16<<20)
+	buf := make([]Record, 0, n)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var r Record
+		if err := json.Unmarshal(line, &r); err != nil {
+			return nil, err
+		}
+		if len(buf) >= n {
+			copy(buf, buf[1:])
+			buf[len(buf)-1] = r
+		} else {
+			buf = append(buf, r)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 func scan(path string) (uint64, string, error) {
 	f, err := os.Open(path)
 	if err != nil {
