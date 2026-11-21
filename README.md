@@ -1,95 +1,92 @@
 # Sentinel-X
 
-**Sentinel-X** is a single-binary, zero-dependency Go security enforcement and observability engine for local LLM endpoints, autonomous agent pipelines, and Linux hosts.
+Single-binary security runtime, policy engine, telemetry sensor (`sentinel-tap`), active containment (`sentinel-hammer`), `sigil.sock` v1 IPC bridge (`sigil-sync`), alert dispatcher, and raw-ANSI terminal console (`sentinel-tui`) for the **SiGiL** (`sigil-framework`) suite.
 
-It favors **layered enforcement with zero wasted motion**: sub-millisecond deterministic YAML policies, hash-chained tamper-evident audit logs, first-class userland telemetry & containment (no cloud lock-in, no dashboard bloat), and live cross-module coordination over `sigil.sock`.
-
----
-
-## Architecture
-
-```text
-[ Host / Network / Agent Runtime ]
-        │
-        ▼
-┌─────────────────────────────────────────┐
-│  1. sentinel-tap & sentinel-bridge      │  <-- Userland /proc + Parent-Dir FIM + LLM/MCP Gate
-└──────────────┬──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────┐
-│  2. sentinel-core (Policy & Anomaly)    │  <-- Hot-reloaded YAML + behavioral baselines + session locks
-└──────────────┬──────────────────────────┘
-               │
-      ┌────────┴────────┐
-      ▼                 ▼
-┌───────────┐    ┌────────────────────────┐
-│ 3. Hammer │    │ 4. sigil-sync & Ledger │  <-- sigil.sock (IPC v1) + SHA-256 hash-chained JSONL
-└─────┬─────┘    └──────┬─────────────────┘
-      │                 │
-      ▼                 ▼
-[ Freeze / Sever ]  [ 5. sentinel-tui & Webhook/Telegram Alerts ]
-```
-
-### Core Modules (Pure Go Standard Library)
-
-| Module | Package | Responsibility |
-| :--- | :--- | :--- |
-| **`sentinel-tap`** | `internal/tap` | Userland Linux process watcher (`/proc`, priv-esc detection), parent-directory File-Integrity Monitor (`inotify` + stat fallback catching atomic `temp -> rename` swaps, writes, creates, deletes, and `chmod`), and `/proc/net/{tcp,tcp6,udp,udp6}` outbound socket watcher (little-endian IPv4 / big-endian port decoding, inode-to-PID mapping). Includes capability-gated eBPF interface (`CAP_BPF`) for privileged native Linux hosts. |
-| **`sentinel-bridge`** | `internal/bridge` | Inline reverse proxy for Ollama/OpenAI endpoints (`/api/generate`, `/api/chat`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`) stripping secrets/PII, blocking prompt injection, and throttling loops; `POST /v1/check` tool-call gate; `sentinel-x exec` wrapper; and strict-stdio `sentinel-x mcp-shim` (keeps `stdout` pure JSON-RPC 2.0). |
-| **`sentinel-core`** | `internal/policy`, `internal/scan` | Strict hot-reloadable YAML rulebooks (`rules/bridge`, `rules/tap`, `rules/sigil`), DNS tunneling Shannon-entropy heuristics, dynamic per-session lock levels (`normal -> elevated -> locked`), and positive bounded-TTL operator rule overrides (max `3600s`). |
-| **`sentinel-hammer`** | `internal/hammer` | Graduated containment: `WARN`, `THROTTLE`, `SEVER` (revokes session tokens & aborts live streams first; capability-gated `CAP_NET_ADMIN` `SOCK_DESTROY` fallback), and `QUARANTINE` (`SIGSTOP` PID or verified-safe `-pgid` with hard safety rails protecting PID 1, self, and ancestors). |
-| **`sigil-sync`** | `internal/sigil` | Canonical versioned NDJSON IPC v1 over Unix Domain Socket (`sigil.sock`, `0600`) with `SO_PEERCRED` peer identification, non-blocking fan-out, legacy `sigil-proxy` alert normalization, and mandatory SHA-256 ledger auditing of every `control_cmd`. |
-| **`sentinel-tui` & `alert`** | `internal/tui`, `internal/alert` | Zero-dependency raw-ANSI operator console (`htop` meets firewall state table) attaching to `sigil.sock`, plus deduplicated async Webhook (optional HMAC-SHA256 + AES-256-GCM encryption) and Telegram Bot API alerting. |
+Built strictly on the **Go standard library** (`go.mod` has zero external dependencies).
 
 ---
 
-## Userland vs. Privileged Capabilities
+## Architecture Overview
 
-Sentinel-X treats **unprivileged Linux userland** (including PRoot, containers, and developer workstations) as a first-class runtime:
-
-- **Works without root:** `/proc` process & priv-esc telemetry, parent-directory FIM (mutations, renames, creates, deletes, `chmod`), `/proc/net` outbound socket tracking, LLM/MCP interception, session/stream `SEVER`, and `SIGSTOP`/`SIGCONT` `QUARANTINE`.
-- **Explicit scope:** Userland FIM watches parent directories for mutations/renames/metadata changes; it does **not** claim unauthorized read observation (which requires `fanotify`/audit/eBPF on privileged Linux or tool-gate wrappers).
-- **Capability-gated extensions:** Kernel eBPF tracing (`CAP_BPF`/`CAP_SYS_ADMIN`) and netlink `SOCK_DESTROY` (`CAP_NET_ADMIN`) gracefully fall back in unprivileged/PRoot environments.
+- **`sentinel-core` (`internal/policy`, `internal/scan`, `internal/event`, `internal/bus`, `internal/ledger`)**: Evaluates `prompt`, `tool_call`, `process`, `file`, `network`, and `sigil_signal` events across `observe` and `enforce` modes, tracks session lock states (`normal` -> `elevated` -> `locked`) and bounded-TTL overrides (`0 < ttl <= 3600s`), runs anomaly/entropy heuristics, publishes events over a non-blocking bus, and writes to an append-only SHA-256 hash-chained JSONL ledger (`sentinel-ledger.jsonl` by default).
+- **`sentinel-bridge` (`internal/bridge`)**: Reverse proxy for Ollama / OpenAI-compatible endpoints, `POST /v1/check` tool-call gate, `/healthz`, in-flight stream/session severing, `sentinel-x exec`, and strict-stdio `sentinel-x mcp-shim`.
+- **`sentinel-tap` (`internal/tap`)**: Userland-first Linux telemetry (`/proc` process & privilege-escalation watcher, parent-directory `inotify`/stat file-integrity watcher for atomic `temp -> rename` / writes / metadata mutations, and `/proc/net/{tcp,tcp6,udp,udp6}` socket watcher) with capability-gated eBPF hooks (`CAP_BPF` / `CAP_SYS_ADMIN`).
+- **`sentinel-hammer` (`internal/hammer`)**: Graduated response executor (`WARN`, `THROTTLE`, userland-first `SEVER`, and `QUARANTINE` via `SIGSTOP` on PID / verified-safe `-pgid`) protected by hard safety rails (`PID <= 1`, self, parent, and ancestor exclusions).
+- **`sigil-sync` (`internal/sigil`)**: Versioned NDJSON Unix domain socket protocol (`sigil.sock`, `0600`, `SO_PEERCRED`), legacy `sigil-proxy` `{timestamp, path, matched_types}` normalization, and mandatory ledger logging for every `control_cmd`.
+- **`sentinel-alert` (`internal/alert`)**: Deduplicated async Webhook (HMAC-SHA256 + optional AES-256-GCM) and Telegram Bot API dispatcher.
+- **`sentinel-tui` (`internal/tui`)**: Zero-dependency raw-ANSI console for live verdicts, session locks, and containment actions.
 
 ---
 
-## Quickstart
+## Build & Rule Lint
 
 ```bash
-# Build single binary and run tests
-make build && make test
-
-# Validate all YAML rulebooks strictly
-bin/sentinel-x lint rules
-
-# Start the full layered daemon (defaults to observe / dry-run mode)
-bin/sentinel-x run -upstream http://127.0.0.1:11434 -workspace ~/agent-workspace
-
-# Enable active enforcement once verdicts look right
-bin/sentinel-x run -mode enforce -upstream http://127.0.0.1:11434 -workspace ~/agent-workspace
-
-# Attach the raw-ANSI operator console in another terminal
-bin/sentinel-x tui
-
-# Wrap any CLI agent command or MCP stdio server
-bin/sentinel-x exec -workspace ~/agent-workspace -- ls -la
-bin/sentinel-x mcp-shim -workspace ~/agent-workspace -- my-mcp-server
-
-# Verify SHA-256 hash-chained audit ledger integrity
-bin/sentinel-x verify sentinel-ledger.jsonl
+cd ~/sentinel-x
+export PATH="/home/octo/.local/bin:$PWD/bin:$PATH"
+go fmt ./cmd/... ./internal/...
+go vet ./...
+go test -count=1 ./...
+go build -o ./bin/sentinel-x ./cmd/sentinel-x
+./bin/sentinel-x lint rules
 ```
-
-### TUI Hotkeys (`sentinel-x tui`)
-- `[j]` / `[k]` — Select quarantined PID
-- `[r]` — Resume (`SIGCONT`) selected PID (audited to ledger)
-- `[x]` — Terminate selected PID (audited to ledger)
-- `[o]` — Apply bounded-TTL (`300s`) rule override to latest matched rule (audited to ledger)
-- `[m]` — Toggle `observe` / `enforce` mode (audited to ledger)
-- `[f]` — Cycle severity filter (`all` / `medium+` / `high+`)
-- `[q]` — Detach cleanly
 
 ---
 
-## Legacy Python Prototype
-Earlier Python correlation scaffolding has been archived cleanly under [`legacy/`](legacy/) to keep the active Go module tree self-contained.
+## Quickstart (`observe` Mode + TUI)
+
+1. Start the daemon in safe `observe` mode:
+
+   ```bash
+   ./bin/sentinel-x run -mode observe -rules ./rules &
+   ```
+
+2. Attach the terminal UI:
+
+   ```bash
+   ./bin/sentinel-x tui
+   ```
+
+3. Send a test tool-call check to `/v1/check`:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:11435/v1/check \
+     -H "Content-Type: application/json" \
+     -d '{"session":"tui-test","target":"tool_call","tool":"bash","args":{"cmd":"cat ~/.ssh/id_rsa"}}'
+   ```
+
+### TUI Hotkeys
+
+- `j` / `k`: Move selection
+- `f`: Filter stream
+- `m`: Toggle `observe` / `enforce` mode over `sigil.sock`
+- `r`: Resume (`SIGCONT`) quarantined target
+- `x`: Terminate quarantined target
+- `o`: Apply time-bounded rule override
+- `q`: Detach TUI (daemon keeps running)
+
+---
+
+## Ledger Verification & Clean Shutdown
+
+Verify the SHA-256 hash chain (uses `sentinel-ledger.jsonl` by default):
+
+```bash
+./bin/sentinel-x verify
+```
+
+Stop cleanly when done:
+
+```bash
+# Press 'q' in sentinel-x tui first, then:
+pkill -f "sentinel-x run"
+rm -f /tmp/sigil-1000.sock
+pgrep -af "sentinel-x" || echo "sentinel-x is stopped"
+```
+
+---
+
+## Environment & Privilege Notes
+
+- **Userland / PRoot first:** `/proc`, parent-directory FIM, session/stream severing, and `SIGSTOP`/`SIGCONT` work without privileged kernel modules or `CAP_NET_ADMIN` / `CAP_BPF`.
+- **Userland FIM scope:** Watches parent directories to catch atomic renames, creates, deletes, writes, and permission/metadata changes—not raw file reads (which require kernel audit/eBPF/fanotify or wrapper enforcement).
+- **MCP stdio hygiene:** `sentinel-x mcp-shim` keeps `stdout` strictly for JSON-RPC 2.0 frames and routes logs to `stderr` / the event bus / ledger.

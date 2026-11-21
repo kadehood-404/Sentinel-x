@@ -722,14 +722,17 @@ func cmdLint(args []string) error {
 }
 
 func cmdVerify(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: sentinel-x verify <ledger-file>")
+	path := "sentinel-ledger.jsonl"
+	if len(args) == 1 {
+		path = args[0]
+	} else if len(args) > 1 {
+		return errors.New("usage: sentinel-x verify [ledger-file]")
 	}
-	n, err := ledger.Verify(args[0])
+	n, err := ledger.Verify(path)
 	if err != nil {
 		return fmt.Errorf("TAMPERED OR CORRUPT after %d good records: %w", n, err)
 	}
-	fmt.Printf("OK: %d records, SHA-256 chain intact\n", n)
+	fmt.Printf("OK: %d records, SHA-256 chain intact (%s)\n", n, path)
 	return nil
 }
 
