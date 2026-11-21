@@ -1,0 +1,112 @@
+# Default sentinel-bridge rulebook.
+#
+# Every rule needs: id, target (prompt | tool_call), action, and a match block.
+# All conditions inside one match block must hold (AND).
+#
+# Actions, weakest to strongest:
+#   WARN        log it, change nothing
+#   THROTTLE    429 the caller (prompts) / tell the agent to back off (tool calls)
+#   REDACT      scrub secrets/PII from the prompt, then forward it (prompts only)
+#   BLOCK       refuse
+#   SEVER, QUARANTINE   treated as BLOCK by the bridge; reserved for sentinel-hammer
+#
+# In observe mode (the default) nothing above WARN is actually applied. The
+# ledger records what WOULD have happened, so you can tune before you enforce.
+
+rules:
+  # ---- prompts headed for a model ------------------------------------------
+  - id: secret-in-prompt
+    description: Credential or key material in a prompt
+    target: prompt
+    severity: high
+    action: REDACT
+    match:
+      finding: [secret]
+
+  - id: pii-in-prompt
+    description: Personal data (email, SSN, phone, card number) in a prompt
+    target: prompt
+    severity: medium
+    action: REDACT
+    match:
+      finding: [pii]
+
+  - id: injection-strong
+    description: Strong prompt-injection phrasing
+    target: prompt
+    severity: high
+    action: BLOCK
+    match:
+      finding: [injection]
+      min_confidence: 0.8
+
+  - id: injection-weak
+    description: Possible prompt-injection phrasing
+    target: prompt
+    severity: low
+    action: WARN
+    match:
+      finding: [injection]
+      min_confidence: 0.4
+
+  - id: prompt-loop
+    description: Same prompt sent repeatedly (runaway agent loop)
+    target: prompt
+    severity: medium
+    action: THROTTLE
+    match:
+      repeat:
+        count: 8
+        window: 60
+
+  # ---- tool calls an agent wants to make -----------------------------------
+  - id: tool-outside-workspace
+    description: Tool call touches a path outside the agent workspace
+    target: tool_call
+    severity: high
+    action: BLOCK
+    match:
+      outside_workspace: true
+
+  - id: tool-sensitive-path
+    description: Tool call touches credentials, keys or dotenv files
+    target: tool_call
+    severity: high
+    action: BLOCK
+    match:
+      arg_regex: '(?i)(\.ssh/|\.aws/credentials|(^|[/\s])\.env\b|id_rsa|id_ed25519|\.gnupg|/etc/shadow|\.kube/config)'
+
+  - id: tool-destructive-shell
+    description: Destructive shell command
+    target: tool_call
+    severity: high
+    action: BLOCK
+    match:
+      tool: [shell, bash, sh, exec, run_command]
+      arg_regex: '(rm\s+-[a-z]*r[a-z]*f?[a-z]*\s+(/|~|\$HOME)|\bmkfs\b|\bdd\s+if=\S+\s+of=/dev/|:\(\)\s*\{|chmod\s+-R\s+777\s+/)'
+
+  - id: tool-pipe-to-shell
+    description: Downloads something and pipes it straight into a shell
+    target: tool_call
+    severity: high
+    action: BLOCK
+    match:
+      arg_regex: '(?i)\b(curl|wget)\b[^|;]*\|\s*(sudo\s+)?(ba|z|da)?sh\b'
+
+  - id: tool-secret-in-args
+    description: Secret passed in tool arguments
+    target: tool_call
+    severity: high
+    action: WARN
+    match:
+      finding: [secret]
+
+  - id: tool-loop
+    description: Same tool call repeated (agent stuck in a retry loop)
+    target: tool_call
+    severity: medium
+    action: THROTTLE
+    match:
+      repeat:
+        count: 5
+        window: 60
