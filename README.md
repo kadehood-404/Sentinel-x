@@ -1,68 +1,92 @@
 # Sentinel-X
 
-Sentinel-X is an open-source intrusion detection framework focused on correlation, transparency, and evidence-based security analysis.
+Single-binary security runtime, policy engine, telemetry sensor (`sentinel-tap`), active containment (`sentinel-hammer`), `sigil.sock` v1 IPC bridge (`sigil-sync`), alert dispatcher, and raw-ANSI terminal console (`sentinel-tui`) for the **SiGiL** (`sigil-framework`) suite.
 
-It is designed to observe system and network behavior, record events in a normalized format, and highlight patterns that may warrant investigation — not to declare compromise by default.
-
-This project favors signal over noise, explainability over theatrics, and facts over fear.
-
-> ⚠️ **DEVELOPMENT STATUS: ACTIVE R&D**
-> Core multi-threaded data ingestion pipelines and log-rotation loops are operational. Current sprint focus: Refining the parsing boundaries and telemetry normalization layers to maintain low-latency tracking under localized data spikes.
+Built strictly on the **Go standard library** (`go.mod` has zero external dependencies).
 
 ---
 
-## Why Sentinel-X Exists
+## Architecture Overview
 
-Modern systems generate enormous amounts of activity. Most of it is normal. Some of it is misconfiguration. A small fraction may be malicious.
-
-Sentinel-X exists to answer one question clearly:
-> **“What actually happened?”**
-
-**It does not scream:**
-* *“You’re hacked”*
-* *“Someone is watching you”*
-* *“Everything is on fire”*
-
-It provides just observable, reviewable data. If Sentinel-X shows nothing suspicious, that is a valid and valuable result.
+- **`sentinel-core` (`internal/policy`, `internal/scan`, `internal/event`, `internal/bus`, `internal/ledger`)**: Evaluates `prompt`, `tool_call`, `process`, `file`, `network`, and `sigil_signal` events across `observe` and `enforce` modes, tracks session lock states (`normal` -> `elevated` -> `locked`) and bounded-TTL overrides (`0 < ttl <= 3600s`), runs anomaly/entropy heuristics, publishes events over a non-blocking bus, and writes to an append-only SHA-256 hash-chained JSONL ledger (`sentinel-ledger.jsonl` by default).
+- **`sentinel-bridge` (`internal/bridge`)**: Reverse proxy for Ollama / OpenAI-compatible endpoints, `POST /v1/check` tool-call gate, `/healthz`, in-flight stream/session severing, `sentinel-x exec`, and strict-stdio `sentinel-x mcp-shim`.
+- **`sentinel-tap` (`internal/tap`)**: Userland-first Linux telemetry (`/proc` process & privilege-escalation watcher, parent-directory `inotify`/stat file-integrity watcher for atomic `temp -> rename` / writes / metadata mutations, and `/proc/net/{tcp,tcp6,udp,udp6}` socket watcher) with capability-gated eBPF hooks (`CAP_BPF` / `CAP_SYS_ADMIN`).
+- **`sentinel-hammer` (`internal/hammer`)**: Graduated response executor (`WARN`, `THROTTLE`, userland-first `SEVER`, and `QUARANTINE` via `SIGSTOP` on PID / verified-safe `-pgid`) protected by hard safety rails (`PID <= 1`, self, parent, and ancestor exclusions).
+- **`sigil-sync` (`internal/sigil`)**: Versioned NDJSON Unix domain socket protocol (`sigil.sock`, `0600`, `SO_PEERCRED`), legacy `sigil-proxy` `{timestamp, path, matched_types}` normalization, and mandatory ledger logging for every `control_cmd`.
+- **`sentinel-alert` (`internal/alert`)**: Deduplicated async Webhook (HMAC-SHA256 + optional AES-256-GCM) and Telegram Bot API dispatcher.
+- **`sentinel-tui` (`internal/tui`)**: Zero-dependency raw-ANSI console for live verdicts, session locks, and containment actions.
 
 ---
 
-## Core Pillars
+## Build & Rule Lint
 
-* **A Correlation-First IDS:** Moves beyond isolated alert triggers to map relationships across disparate system events.
-* **A Forensic-Friendly Event Recorder:** Normalizes raw telemetry into immutable, structured historical logs.
-* **A Transparent Security Observability Tool:** Suitable for home labs, small networks, and infrastructure research.
-
-**What Sentinel-X Is Not:**
-* Not antivirus software or an EDR replacement.
-* Not a magic breach detector.
-* Not a tool for confirming suspicions without evidence.
-
----
-
-## Technical Architecture & Ingestion Pipeline
-
-To maintain this zero-theatrics posture under load, the framework operates as a decoupled, multi-threaded state engine. This producer-consumer layout ensures intensive heuristic evaluation never blocks the live incoming telemetry capture.
-
-[Network Interfaces] ---> (Ingestion Thread 01) ---\
-[System Event Logs]  ---> (Ingestion Thread 02) ----+---> [Thread-Safe Queue] ---> [Correlation Engine] ---> [Normalized Logs]
-[Hardware Telem]     ---> (Ingestion Thread 03) ---/
-
-1. **Ingestion Layer (Producers):** Isolated, light-weight worker threads poll system sockets, log pools, or hardware telemetry interfaces.
-2. **The Ingestion Queue:** A thread-safe FIFO buffer aggregates raw event payloads, isolating the ingestion boundary from down-stream processing lag.
-3. **The Correlation Engine (Consumer):** Decoupled analyzer loops pull telemetry from the queue, evaluate patterns against structural invariants, and write to clean forensic logs.
+```bash
+cd ~/sentinel-x
+export PATH="/home/octo/.local/bin:$PWD/bin:$PATH"
+go fmt ./cmd/... ./internal/...
+go vet ./...
+go test -count=1 ./...
+go build -o ./bin/sentinel-x ./cmd/sentinel-x
+./bin/sentinel-x lint rules
+```
 
 ---
 
-## Operational Roadmap
+## Quickstart (`observe` Mode + TUI)
 
-- [x] Asynchronous multi-threaded worker pipeline infrastructure
-- [x] Fail-safe, zero-loss log-rotation mechanism
-- [ ] Implement extensible signature-matching modules for localized environment anomalies
-- [ ] Standardize automated integration test suites for malformed network frames
+1. Start the daemon in safe `observe` mode:
+
+   ```bash
+   ./bin/sentinel-x run -mode observe -rules ./rules &
+   ```
+
+2. Attach the terminal UI:
+
+   ```bash
+   ./bin/sentinel-x tui
+   ```
+
+3. Send a test tool-call check to `/v1/check`:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:11435/v1/check \
+     -H "Content-Type: application/json" \
+     -d '{"session":"tui-test","target":"tool_call","tool":"bash","args":{"cmd":"cat ~/.ssh/id_rsa"}}'
+   ```
+
+### TUI Hotkeys
+
+- `j` / `k`: Move selection
+- `f`: Filter stream
+- `m`: Toggle `observe` / `enforce` mode over `sigil.sock`
+- `r`: Resume (`SIGCONT`) quarantined target
+- `x`: Terminate quarantined target
+- `o`: Apply time-bounded rule override
+- `q`: Detach TUI (daemon keeps running)
 
 ---
 
-## Defensive Posture
+## Ledger Verification & Clean Shutdown
 
-Sentinel-X assumes a zero-trust architecture regarding input data. All data structures passing through the ingestion queue are treated as potentially hostile or malformed. By executing structural validation inside isolated consumer threads, any malformation designed to cause a script panic is safely contained, keeping the core tracking framework completely online.
+Verify the SHA-256 hash chain (uses `sentinel-ledger.jsonl` by default):
+
+```bash
+./bin/sentinel-x verify
+```
+
+Stop cleanly when done:
+
+```bash
+# Press 'q' in sentinel-x tui first, then:
+pkill -f "sentinel-x run"
+rm -f /tmp/sigil-1000.sock
+pgrep -af "sentinel-x" || echo "sentinel-x is stopped"
+```
+
+---
+
+## Environment & Privilege Notes
+
+- **Userland / PRoot first:** `/proc`, parent-directory FIM, session/stream severing, and `SIGSTOP`/`SIGCONT` work without privileged kernel modules or `CAP_NET_ADMIN` / `CAP_BPF`.
+- **Userland FIM scope:** Watches parent directories to catch atomic renames, creates, deletes, writes, and permission/metadata changes—not raw file reads (which require kernel audit/eBPF/fanotify or wrapper enforcement).
+- **MCP stdio hygiene:** `sentinel-x mcp-shim` keeps `stdout` strictly for JSON-RPC 2.0 frames and routes logs to `stderr` / the event bus / ledger.
