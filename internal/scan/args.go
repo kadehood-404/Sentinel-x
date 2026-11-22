@@ -14,7 +14,7 @@ func Flatten(v any) string {
 	walk = func(v any) {
 		switch t := v.(type) {
 		case string:
-			parts = append(parts, t)
+			parts = append(parts, NormalizeShellSeparators(t))
 		case float64, int, int64, bool:
 			parts = append(parts, fmt.Sprint(t))
 		case []any:
@@ -33,7 +33,7 @@ func Flatten(v any) string {
 		}
 	}
 	walk(v)
-	return strings.Join(parts, " ")
+	return strings.TrimSpace(collapseSpace.ReplaceAllString(strings.Join(parts, " "), " "))
 }
 
 // harmlessPaths are absolute paths that are fine for any command to touch.
@@ -44,7 +44,8 @@ var harmlessPaths = map[string]bool{
 // ExtractPaths pulls path-looking tokens out of a command line or argument
 // blob: absolute paths, ~ paths, and anything that climbs with "..".
 func ExtractPaths(text string) []string {
-	fields := strings.FieldsFunc(text, func(r rune) bool {
+	norm := NormalizeShellSeparators(text)
+	fields := strings.FieldsFunc(norm, func(r rune) bool {
 		switch r {
 		case ' ', '\t', '\n', '"', '\'', '=', ';', '|', '&', '<', '>', '(', ')', ',':
 			return true

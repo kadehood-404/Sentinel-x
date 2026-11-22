@@ -44,6 +44,21 @@ func p(kind Kind, name, expr string, weight float64) pattern {
 	return pattern{kind: kind, name: name, re: regexp.MustCompile(expr), weight: weight}
 }
 
+var (
+	ifsExprRe     = regexp.MustCompile(`\$\{IFS\}|\$IFS\b`)
+	collapseSpace = regexp.MustCompile(`\s+`)
+)
+
+// NormalizeShellSeparators expands ${IFS} / $IFS separator bypasses and collapses
+// repeated whitespace into single spaces so lexical variants match deterministically.
+func NormalizeShellSeparators(text string) string {
+	if text == "" {
+		return ""
+	}
+	replaced := ifsExprRe.ReplaceAllString(text, " ")
+	return strings.TrimSpace(collapseSpace.ReplaceAllString(replaced, " "))
+}
+
 var patterns = []pattern{
 	// Secrets.
 	p(Secret, "aws_access_key", `\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`, 1),
@@ -86,10 +101,11 @@ var patterns = []pattern{
 
 // Scan returns all findings in text, ordered by position.
 func Scan(text string) []Finding {
+	normalized := NormalizeShellSeparators(text)
 	var out []Finding
 	for _, pt := range patterns {
-		for _, m := range pt.re.FindAllStringIndex(text, -1) {
-			if pt.validate != nil && !pt.validate(text[m[0]:m[1]]) {
+		for _, m := range pt.re.FindAllStringIndex(normalized, -1) {
+			if pt.validate != nil && !pt.validate(normalized[m[0]:m[1]]) {
 				continue
 			}
 			out = append(out, Finding{Kind: pt.kind, Name: pt.name, Confidence: pt.weight, Start: m[0], End: m[1]})

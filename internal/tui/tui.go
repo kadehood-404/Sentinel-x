@@ -41,7 +41,6 @@ type UIState struct {
 	FilterSeverity string // "" | "high" | "medium"
 	StatusLine     string
 	Connected      bool
-	DefaultTTLSec  int // bounded TTL for one-key [o] rule override (default 300s)
 }
 
 // Render formats a crisp ANSI terminal frame from snap and ui without requiring
@@ -154,13 +153,9 @@ func Render(snap sigil.StateSnapshot, ui UIState, width int) string {
 	if ui.StatusLine != "" {
 		fmt.Fprintf(&b, "%s%s%s\r\n", ansiYellow, ui.StatusLine, ansiReset)
 	}
-	ttl := ui.DefaultTTLSec
-	if ttl <= 0 {
-		ttl = 300
-	}
-	fmt.Fprintf(&b, "%s[j/k]%s select  %s[r]%s resume PID  %s[x]%s kill PID  %s[o]%s override latest (%ds)  %s[m]%s mode  %s[f]%s filter  %s[q]%s quit\r\n",
+	fmt.Fprintf(&b, "%s[j/k]%s select  %s[r]%s resume PID  %s[x]%s kill PID  %s[f]%s filter  %s[q]%s quit\r\n",
 		ansiBold, ansiReset, ansiBold, ansiReset, ansiBold, ansiReset,
-		ansiBold, ansiReset, ttl, ansiBold, ansiReset, ansiBold, ansiReset, ansiBold, ansiReset)
+		ansiBold, ansiReset, ansiBold, ansiReset)
 	return b.String()
 }
 
@@ -183,7 +178,7 @@ func Run(ctx context.Context, sockPath string) error {
 	_, _ = io.WriteString(os.Stdout, ansiHideCur)
 	defer func() { _, _ = io.WriteString(os.Stdout, ansiShowCur+ansiReset) }()
 
-	ui := UIState{Connected: true, DefaultTTLSec: 300}
+	ui := UIState{Connected: true}
 	var snap sigil.StateSnapshot
 
 	evCh := make(chan sigil.Envelope, 64)
@@ -301,23 +296,6 @@ func Run(ctx context.Context, sockPath string) error {
 				} else {
 					ui.StatusLine = "no quarantined PID selected"
 				}
-			case 'm':
-				next := "enforce"
-				if strings.EqualFold(snap.Mode, "enforce") {
-					next = "observe"
-				}
-				sendCmd(sigil.ControlCmdPayload{Cmd: "set_mode", Mode: next, Reason: "tui mode toggle"})
-			case 'o':
-				// Bounded TTL override on the most recent matched rule.
-				ruleID, sess := latestRule(snap.RecentVerdicts)
-				if ruleID == "" {
-					ui.StatusLine = "no recent matched rule to override"
-				} else {
-					sendCmd(sigil.ControlCmdPayload{
-						Cmd: "override_rule", RuleID: ruleID, Session: sess,
-						TTLSeconds: ui.DefaultTTLSec, Reason: "tui one-key override",
-					})
-				}
 			case 'f':
 				switch ui.FilterSeverity {
 				case "":
@@ -331,15 +309,6 @@ func Run(ctx context.Context, sockPath string) error {
 			draw()
 		}
 	}
-}
-
-func latestRule(evs []event.Event) (string, string) {
-	for i := len(evs) - 1; i >= 0; i-- {
-		if evs[i].Verdict != nil && len(evs[i].Verdict.Rules) > 0 {
-			return evs[i].Verdict.Rules[0], evs[i].Session
-		}
-	}
-	return "", ""
 }
 
 func passesSeverityFilter(sev, filter string) bool {

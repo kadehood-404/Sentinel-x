@@ -17,6 +17,8 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kadehood-404/sentinel-x/internal/event"
 	"github.com/kadehood-404/sentinel-x/internal/ledger"
@@ -45,6 +48,12 @@ type Config struct {
 	Logf      func(string, ...any)
 }
 
+type sessionRecord struct {
+	id        string
+	createdAt time.Time
+	lastSeen  time.Time
+}
+
 type Server struct {
 	cfg   Config
 	proxy *httputil.ReverseProxy
@@ -52,6 +61,7 @@ type Server struct {
 
 	mu        sync.Mutex
 	nextReqID uint64
+	sessions  map[string]*sessionRecord
 	active    map[string]map[uint64]context.CancelFunc // session -> active stream cancels
 	revoked   map[string]bool
 }
@@ -76,11 +86,12 @@ func New(cfg Config) *Server {
 		cfg.Logf = func(string, ...any) {}
 	}
 	s := &Server{
-		cfg:     cfg,
-		proxy:   httputil.NewSingleHostReverseProxy(cfg.Upstream),
-		mux:     http.NewServeMux(),
-		active:  map[string]map[uint64]context.CancelFunc{},
-		revoked: map[string]bool{},
+		cfg:      cfg,
+		proxy:    httputil.NewSingleHostReverseProxy(cfg.Upstream),
+		mux:      http.NewServeMux(),
+		sessions: map[string]*sessionRecord{},
+		active:   map[string]map[uint64]context.CancelFunc{},
+		revoked:  map[string]bool{},
 	}
 	s.proxy.FlushInterval = -1 // stream model output as it arrives
 	s.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -98,6 +109,7 @@ func New(cfg Config) *Server {
 			"rules": len(rs.Rules), "rules_version": rs.Signature,
 		})
 	})
+	s.mux.HandleFunc("/v1/session", s.handleSession)
 	s.mux.HandleFunc("/v1/check", s.handleCheck)
 	s.mux.HandleFunc("/", s.handleProxy)
 	return s
@@ -166,10 +178,85 @@ func (s *Server) trackStream(session string, parent context.Context) (context.Co
 	}
 }
 
+func newOpaqueSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "sess_" + hex.EncodeToString(b[:]), nil
+}
+
+func (s *Server) mintSession(now time.Time) (string, error) {
+	id, err := newOpaqueSessionID()
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.sessions[id] != nil {
+		id, err = newOpaqueSessionID()
+		if err != nil {
+			return "", err
+		}
+	}
+	s.sessions[id] = &sessionRecord{
+		id:        id,
+		createdAt: now,
+		lastSeen:  now,
+	}
+	return id, nil
+}
+
+// resolveOrMintSession validates a caller-supplied bearer token in
+// Authorization: Bearer <token> against daemon-minted active sessions; if
+// absent or invalid/unknown, it mints a fresh opaque session token instead of
+// trusting arbitrary caller strings or IP addresses.
+func (s *Server) resolveOrMintSession(r *http.Request) (string, bool) {
+	now := time.Now().UTC()
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		token := strings.TrimSpace(auth[7:])
+		if token != "" {
+			s.mu.Lock()
+			if rec, ok := s.sessions[token]; ok {
+				if !s.revoked[token] {
+					rec.lastSeen = now
+				}
+				s.mu.Unlock()
+				return token, false
+			}
+			s.mu.Unlock()
+		}
+	}
+	id, err := s.mintSession(now)
+	if err != nil {
+		return "", false
+	}
+	return id, true
+}
+
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	id, err := s.mintSession(time.Now().UTC())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to mint session"})
+		return
+	}
+	w.Header().Set("X-Sentinel-Session", id)
+	writeJSON(w, http.StatusCreated, map[string]any{"session": id})
+}
+
 // ---- prompt gate -----------------------------------------------------------
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	session := sessionID(r)
+	session, minted := s.resolveOrMintSession(r)
+	if minted && session != "" {
+		w.Header().Set("X-Sentinel-Session", session)
+	}
 	if s.cfg.Engine.Mode() == policy.Enforce && s.isRevoked(session) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "session severed by sentinel-x"})
 		return
@@ -187,7 +274,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, stop := s.inspect(w, r, body)
+	out, stop := s.inspect(w, r, session, body)
 	if stop {
 		return
 	}
@@ -201,9 +288,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 // inspect judges a prompt body. It returns the body to forward, or stop=true
 // if it already wrote a response.
-func (s *Server) inspect(w http.ResponseWriter, r *http.Request, body []byte) ([]byte, bool) {
+func (s *Server) inspect(w http.ResponseWriter, r *http.Request, session string, body []byte) ([]byte, bool) {
 	eng := s.cfg.Engine
-	session := sessionID(r)
 
 	var doc any
 	if err := json.Unmarshal(body, &doc); err != nil {
@@ -260,7 +346,6 @@ func (s *Server) inspect(w http.ResponseWriter, r *http.Request, body []byte) ([
 // ---- tool-call checker -----------------------------------------------------
 
 type CheckRequest struct {
-	Session   string         `json:"session"`
 	Tool      string         `json:"tool"`
 	Args      map[string]any `json:"args"`
 	Workspace string         `json:"workspace"`
@@ -291,14 +376,17 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "\"tool\" is required"})
 		return
 	}
-	if req.Session == "" {
-		req.Session = sessionID(r)
+
+	session, minted := s.resolveOrMintSession(r)
+	if minted && session != "" {
+		w.Header().Set("X-Sentinel-Session", session)
 	}
-	if req.Workspace == "" {
-		req.Workspace = s.cfg.Workspace
+	workspace := req.Workspace
+	if workspace == "" {
+		workspace = s.cfg.Workspace
 	}
 
-	if s.cfg.Engine.Mode() == policy.Enforce && s.isRevoked(req.Session) {
+	if s.cfg.Engine.Mode() == policy.Enforce && s.isRevoked(session) {
 		writeJSON(w, http.StatusOK, CheckResponse{
 			Decision:  "deny",
 			Action:    policy.Sever.String(),
@@ -322,10 +410,10 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	v := s.cfg.Engine.Evaluate(policy.Input{
-		Target: "tool_call", Session: req.Session, Tool: req.Tool, Verb: "exec", ArgText: argText,
-		Paths: paths, Workspace: req.Workspace, Findings: toPolicy(findings),
+		Target: "tool_call", Session: session, Tool: req.Tool, Verb: "exec", ArgText: argText,
+		Paths: paths, Workspace: workspace, Findings: toPolicy(findings),
 	})
-	ev := s.verdictEvent("tool_call", req.Tool, req.Session, v, findings)
+	ev := s.verdictEvent("tool_call", req.Tool, session, v, findings)
 	ev.Action = event.Action{Category: "process", Verb: "exec"}
 	if len(v.Matches) > 0 {
 		s.log(ev)
@@ -418,17 +506,6 @@ func toPolicy(fs []scan.Finding) []policy.Finding {
 		out[i] = policy.Finding{Kind: string(f.Kind), Name: f.Name, Confidence: f.Confidence}
 	}
 	return out
-}
-
-func sessionID(r *http.Request) string {
-	if s := r.Header.Get("X-Sentinel-Session"); s != "" {
-		return s
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 func looksLikePathKey(k string) bool {

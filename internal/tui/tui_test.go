@@ -40,7 +40,7 @@ func TestRenderIncludesCoreSections(t *testing.T) {
 		RecentVerdicts: []event.Event{ev},
 	}
 
-	out := Render(snap, UIState{Connected: true, DefaultTTLSec: 300}, 100)
+	out := Render(snap, UIState{Connected: true}, 100)
 	for _, want := range []string{"SENTINEL-X", "ENFORCE", "agent-42", "PID 4321", "tool-destructive-shell", "OVERRIDE", "[r]"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered TUI output missing %q:\n%s", want, out)

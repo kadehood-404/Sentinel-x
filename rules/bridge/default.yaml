@@ -82,8 +82,8 @@ rules:
     severity: high
     action: BLOCK
     match:
-      tool: [shell, bash, sh, exec, run_command]
-      arg_regex: '(rm\s+-[a-z]*r[a-z]*f?[a-z]*\s+(/|~|\$HOME)|\bmkfs\b|\bdd\s+if=\S+\s+of=/dev/|:\(\)\s*\{|chmod\s+-R\s+777\s+/)'
+      tool: [shell, bash, sh, zsh, fish, exec, run_command, run_shell, terminal, execute, cmd, python]
+      arg_regex: '(?:^|[;&|()]|\s)rm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*\s+-[a-zA-Z]*[fF][a-zA-Z]*|-[a-zA-Z]*[fF][a-zA-Z]*\s+-[a-zA-Z]*[rR][a-zA-Z]*|-[a-zA-Z]*(?:[rR][a-zA-Z]*[fF]|[fF][a-zA-Z]*[rR])[a-zA-Z]*)(?:\s+--)?\s+(/|~|\$HOME|\$\{HOME\}|\.\.)|\bmkfs(?:\.[a-z0-9]+)?\b|\bdd\s+if=\S+\s+of=/dev/|:\(\)\s*\{|chmod\s+(?:-[a-zA-Z]*R[a-zA-Z]*\s+)?777\s+/'
 
   - id: tool-pipe-to-shell
     description: Downloads something and pipes it straight into a shell

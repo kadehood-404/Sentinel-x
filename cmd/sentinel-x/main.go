@@ -330,38 +330,6 @@ func cmdRun(args []string) error {
 					}
 					s := snapshotFn()
 					return true, fmt.Sprintf("terminated pid %d", cmd.PID), &s
-				case "set_mode":
-					m, err := policy.ParseMode(cmd.Mode)
-					if err != nil {
-						return false, err.Error(), nil
-					}
-					eng.SetMode(m)
-					s := snapshotFn()
-					return true, "mode set to " + m.String(), &s
-				case "set_session_lock":
-					lvl, err := policy.ParseLockLevel(cmd.LockLevel)
-					if err != nil {
-						return false, err.Error(), nil
-					}
-					ttl := time.Duration(cmd.TTLSeconds) * time.Second
-					eng.SetSessionLock(cmd.Session, lvl, ttl, cmd.Reason, peer.Source)
-					if lvl == policy.LockNormal {
-						br.UnrevokeSession(cmd.Session)
-					}
-					s := snapshotFn()
-					return true, fmt.Sprintf("session %s lock=%s", cmd.Session, lvl), &s
-				case "override_rule":
-					ttl := time.Duration(cmd.TTLSeconds) * time.Second
-					ov, err := eng.AddOverride(cmd.RuleID, cmd.Session, ttl, cmd.Reason)
-					if err != nil {
-						return false, err.Error(), nil
-					}
-					s := snapshotFn()
-					return true, fmt.Sprintf("override %s active until %s", ov.RuleID, ov.ExpiresAt.Format(time.RFC3339)), &s
-				case "clear_override":
-					eng.ClearOverride(cmd.RuleID, cmd.Session)
-					s := snapshotFn()
-					return true, "override cleared", &s
 				default:
 					return false, "unknown control_cmd: " + cmd.Cmd, nil
 				}

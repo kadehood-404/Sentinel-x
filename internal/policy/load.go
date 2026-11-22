@@ -208,8 +208,9 @@ func compileRule(item any) (*Rule, error) {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
 	for i := range r.Tools {
-		r.Tools[i] = strings.ToLower(r.Tools[i])
+		r.Tools[i] = NormalizeToolName(r.Tools[i])
 	}
+	r.Tools = dedupe(r.Tools)
 	if r.Verbs, err = strList(mm, "action_verb"); err != nil {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
@@ -300,11 +301,13 @@ func compileRule(item any) (*Rule, error) {
 // matches reports whether every condition holds, with a human-readable reason.
 func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock LockLevel) (bool, string) {
 	var why []string
+	normTool := NormalizeToolName(in.Tool)
+	normArgText := NormalizeShellText(in.ArgText)
 
 	if len(r.Tools) > 0 {
 		hit := false
 		for _, t := range r.Tools {
-			if strings.EqualFold(t, in.Tool) {
+			if strings.EqualFold(NormalizeToolName(t), normTool) {
 				hit = true
 				break
 			}
@@ -312,7 +315,7 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock L
 		if !hit {
 			return false, ""
 		}
-		why = append(why, "tool "+in.Tool)
+		why = append(why, "tool "+normTool)
 	}
 	if len(r.Verbs) > 0 {
 		hit := false
@@ -328,7 +331,7 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock L
 		why = append(why, "verb "+in.Verb)
 	}
 	if r.ArgRegex != nil {
-		if !r.ArgRegex.MatchString(in.ArgText) {
+		if !r.ArgRegex.MatchString(normArgText) {
 			return false, ""
 		}
 		why = append(why, "arguments matched pattern")
@@ -336,8 +339,9 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock L
 	if r.PathRegex != nil {
 		matchedPath := ""
 		for _, p := range in.Paths {
-			if r.PathRegex.MatchString(p) {
-				matchedPath = p
+			normPath := NormalizeShellText(p)
+			if r.PathRegex.MatchString(normPath) {
+				matchedPath = normPath
 				break
 			}
 		}
@@ -347,9 +351,9 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock L
 		why = append(why, "path matched "+matchedPath)
 	}
 	if r.ProcessRegex != nil {
-		target := in.Process
+		target := NormalizeShellText(in.Process)
 		if target == "" {
-			target = in.ArgText
+			target = normArgText
 		}
 		if !r.ProcessRegex.MatchString(target) {
 			return false, ""
@@ -376,7 +380,11 @@ func (r *Rule) matches(in Input, times []time.Time, now time.Time, sessionLock L
 		why = append(why, fmt.Sprintf("dest_port %d", in.DestPort))
 	}
 	if r.OutsideWorkspace {
-		p, out := OutsideWorkspace(in.Workspace, in.Paths)
+		normPaths := make([]string, len(in.Paths))
+		for i, p := range in.Paths {
+			normPaths[i] = NormalizeShellText(p)
+		}
+		p, out := OutsideWorkspace(in.Workspace, normPaths)
 		if !out {
 			return false, ""
 		}

@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,10 +40,24 @@ func TestSeverSessionAbortsInFlightStreamAndRevokesToken(t *testing.T) {
 	srv := httptest.NewServer(br)
 	defer srv.Close()
 
-	// Start a streaming request tagged with X-Sentinel-Session: rogue-1.
+	// Mint a daemon session token via /v1/session.
+	sessResp, err := http.Post(srv.URL+"/v1/session", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var minted struct {
+		Session string `json:"session"`
+	}
+	if err := json.NewDecoder(sessResp.Body).Decode(&minted); err != nil || minted.Session == "" {
+		sessResp.Body.Close()
+		t.Fatalf("failed to mint session: status=%d err=%v", sessResp.StatusCode, err)
+	}
+	sessResp.Body.Close()
+
+	// Start a streaming request authenticated with the minted Bearer token.
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/generate", strings.NewReader(`{"model":"m","prompt":"stream"}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Sentinel-Session", "rogue-1")
+	req.Header.Set("Authorization", "Bearer "+minted.Session)
 
 	done := make(chan error, 1)
 	go func() {
@@ -63,7 +78,7 @@ func TestSeverSessionAbortsInFlightStreamAndRevokesToken(t *testing.T) {
 	}
 
 	// Sever the session -> must cancel the in-flight upstream stream!
-	cut := br.SeverSession("rogue-1")
+	cut := br.SeverSession(minted.Session)
 	if cut != 1 {
 		t.Fatalf("SeverSession cut=%d, want 1", cut)
 	}
@@ -74,9 +89,10 @@ func TestSeverSessionAbortsInFlightStreamAndRevokesToken(t *testing.T) {
 	}
 	<-done
 
-	// Subsequent /v1/check and proxy calls for rogue-1 must be denied.
+	// Subsequent /v1/check and proxy calls with the revoked token must be denied.
 	checkReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/check",
-		strings.NewReader(`{"session":"rogue-1","tool":"read_file","args":{"path":"src/a.go"}}`))
+		strings.NewReader(`{"tool":"read_file","args":{"path":"src/a.go"}}`))
+	checkReq.Header.Set("Authorization", "Bearer "+minted.Session)
 	resp, err := http.DefaultClient.Do(checkReq)
 	if err != nil {
 		t.Fatal(err)
@@ -85,5 +101,17 @@ func TestSeverSessionAbortsInFlightStreamAndRevokesToken(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(string(b), `"decision":"deny"`) || !strings.Contains(string(b), "session-severed") {
 		t.Fatalf("expected revoked session check to deny, got %s", b)
+	}
+
+	proxyReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/generate", strings.NewReader(`{"model":"m","prompt":"after"}`))
+	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyReq.Header.Set("Authorization", "Bearer "+minted.Session)
+	proxyResp, err := http.DefaultClient.Do(proxyReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyResp.Body.Close()
+	if proxyResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected revoked session proxy call to return 403, got %d", proxyResp.StatusCode)
 	}
 }

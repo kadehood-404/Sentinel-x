@@ -15,6 +15,7 @@ package policy
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -232,9 +233,63 @@ func (v Verdict) RuleIDs() []string {
 	return ids
 }
 
+var shellExecAliases = map[string]bool{
+	"shell": true, "bash": true, "sh": true, "zsh": true, "fish": true,
+	"exec": true, "run_command": true, "run-command": true, "run_shell": true, "run-shell": true,
+	"terminal": true, "execute": true, "cmd": true, "command": true,
+	"python": true, "python3": true, "perl": true, "ruby": true, "node": true,
+}
+
 var elevatedBlockedTools = map[string]bool{
 	"shell": true, "bash": true, "sh": true, "exec": true,
 	"run_command": true, "curl": true, "wget": true, "http": true, "fetch": true,
+}
+
+var (
+	ifsExprRe    = regexp.MustCompile(`\$\{IFS\}|\$IFS\b`)
+	multiSpaceRe = regexp.MustCompile(`\s+`)
+)
+
+// NormalizeToolName canonicalizes shell, command, and script-runner tool
+// aliases onto "shell" so rules cannot be bypassed by renaming the tool.
+func NormalizeToolName(tool string) string {
+	t := strings.ToLower(strings.TrimSpace(tool))
+	if t == "" {
+		return ""
+	}
+	base := filepath.Base(t)
+	if shellExecAliases[t] || shellExecAliases[base] {
+		return "shell"
+	}
+	return t
+}
+
+// NormalizeShellText expands ${IFS} / $IFS separator bypasses and collapses
+// repeated whitespace into single spaces.
+func NormalizeShellText(s string) string {
+	if s == "" {
+		return ""
+	}
+	expanded := ifsExprRe.ReplaceAllString(s, " ")
+	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(expanded, " "))
+}
+
+func normalizeInput(in Input) Input {
+	out := in
+	out.Tool = NormalizeToolName(in.Tool)
+	if in.ArgText != "" {
+		out.ArgText = NormalizeShellText(in.ArgText)
+	}
+	if in.Process != "" {
+		out.Process = NormalizeShellText(in.Process)
+	}
+	if len(in.Paths) > 0 {
+		out.Paths = make([]string, len(in.Paths))
+		for i, p := range in.Paths {
+			out.Paths[i] = NormalizeShellText(p)
+		}
+	}
+	return out
 }
 
 // Engine evaluates inputs against the currently loaded ruleset.
@@ -438,15 +493,16 @@ func overrideKey(ruleID, session string) string { return ruleID + "\x00" + sessi
 
 // Evaluate judges one input.
 func (e *Engine) Evaluate(in Input) Verdict {
+	normIn := normalizeInput(in)
 	now := e.now()
-	times := e.record(in, now)
-	lockState := e.SessionLock(in.Session)
+	times := e.record(normIn, now)
+	lockState := e.SessionLock(normIn.Session)
 	v := Verdict{Mode: e.Mode()}
 
 	// Built-in session-lock guardrails when a session has been tightened by
 	// sigil-sync or operator control.
-	if lockState.level >= LockLocked && (in.Target == "tool_call" || in.Target == "prompt") {
-		if !e.isOverridden("session-lock-locked", in.Session, now) {
+	if lockState.level >= LockLocked && (normIn.Target == "tool_call" || normIn.Target == "prompt") {
+		if !e.isOverridden("session-lock-locked", normIn.Session, now) {
 			reason := "session is locked"
 			if lockState.Reason != "" {
 				reason += ": " + lockState.Reason
@@ -460,9 +516,9 @@ func (e *Engine) Evaluate(in Input) Verdict {
 				action:      Block,
 			})
 		}
-	} else if lockState.level >= LockElevated && in.Target == "tool_call" && elevatedBlockedTools[strings.ToLower(in.Tool)] {
-		if !e.isOverridden("session-lock-elevated", in.Session, now) {
-			reason := "session lock elevated; restricted tool " + in.Tool
+	} else if lockState.level >= LockElevated && normIn.Target == "tool_call" && elevatedBlockedTools[normIn.Tool] {
+		if !e.isOverridden("session-lock-elevated", normIn.Session, now) {
+			reason := "session lock elevated; restricted tool " + normIn.Tool
 			if lockState.Reason != "" {
 				reason += " (" + lockState.Reason + ")"
 			}
@@ -480,13 +536,13 @@ func (e *Engine) Evaluate(in Input) Verdict {
 	rs := e.rs.Load()
 	if rs != nil {
 		for _, r := range rs.Rules {
-			if r.Target != in.Target {
+			if r.Target != normIn.Target {
 				continue
 			}
-			if e.isOverridden(r.ID, in.Session, now) {
+			if e.isOverridden(r.ID, normIn.Session, now) {
 				continue
 			}
-			if ok, why := r.matches(in, times, now, lockState.level); ok {
+			if ok, why := r.matches(normIn, times, now, lockState.level); ok {
 				v.Matches = append(v.Matches, Match{
 					RuleID: r.ID, Description: r.Description, Severity: r.Severity,
 					Action: r.Action.String(), Reason: why, action: r.Action,

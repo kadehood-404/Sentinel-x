@@ -141,9 +141,30 @@ func TestLedgerNeverContainsSecretsOrPromptText(t *testing.T) {
 
 func TestPromptLoopIsThrottled(t *testing.T) {
 	r := newRig(t, policy.Enforce)
+	code, body := r.post(t, "/v1/session", "")
+	if code != http.StatusCreated {
+		t.Fatalf("mint session: code=%d body=%s", code, body)
+	}
+	var sess struct {
+		Session string `json:"session"`
+	}
+	if err := json.Unmarshal([]byte(body), &sess); err != nil || sess.Session == "" {
+		t.Fatalf("decode session: err=%v body=%s", err, body)
+	}
 	var last int
 	for i := 0; i < 9; i++ {
-		last, _ = r.post(t, "/api/generate", `{"model":"m","prompt":"retry the same thing"}`)
+		req, err := http.NewRequest(http.MethodPost, r.srv.URL+"/api/generate", strings.NewReader(`{"model":"m","prompt":"retry the same thing"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+sess.Session)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		last = resp.StatusCode
 	}
 	if last != http.StatusTooManyRequests {
 		t.Fatalf("9th identical prompt: code=%d, want 429", last)
